@@ -6,13 +6,81 @@ from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+    ValidationError,
+)
 
+from hedge_fund.brokers.costs import TradingCosts
 from hedge_fund.risk.limits import RiskLimits
-from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent, get_investment_approach
+from hedge_fund.signals import ALPHA_MODEL_REGISTRY, LLMAgent, get_horizon_days, get_investment_approach
 from hedge_fund.signals.base import AlphaModel
 
 PortfolioMode: TypeAlias = Literal["long_only", "long_short", "dollar_neutral"]
+Cadence: TypeAlias = Literal["minute", "daily", "weekly", "monthly"]
+
+# The shortest interval a minute fund may run at: a session key is stamped
+# to the second, so one second is the finest bar there is. A snapshot round
+# trip is about a second per name, so at the fastest settings the runner
+# will miss bars (logged as gaps) rather than fall behind its clock.
+MIN_INTERVAL_SECONDS = 1
+
+# US extended hours: the earliest and latest a trading window may reach.
+EARLIEST_WINDOW = "04:00"
+LATEST_WINDOW = "20:00"
+
+
+def _clock_seconds(hhmm: str) -> int:
+    """Seconds since midnight for an HH:MM string; ValueError otherwise."""
+    try:
+        hours, minutes = hhmm.split(":")
+        h, m = int(hours), int(minutes)
+    except (AttributeError, ValueError):
+        raise ValueError(f"{hhmm!r} is not a time of day (HH:MM)") from None
+    if not (0 <= h < 24 and 0 <= m < 60 and len(hours) == 2 and len(minutes) == 2):
+        raise ValueError(f"{hhmm!r} is not a time of day (HH:MM)")
+    return h * 3600 + m * 60
+
+
+class TradingWindow(BaseModel):
+    """When a minute fund trades, in New York time. Both ends are sessions:
+    the window opens with a bar at `start` and always closes with one at `end`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start: str = "09:30"
+    end: str = "16:00"
+
+    @field_validator("start", "end")
+    @classmethod
+    def _within_extended_hours(cls, value: str) -> str:
+        seconds = _clock_seconds(value)
+        if not _clock_seconds(EARLIEST_WINDOW) <= seconds <= _clock_seconds(LATEST_WINDOW):
+            raise ValueError(f"{value} is outside US extended hours ({EARLIEST_WINDOW}–{LATEST_WINDOW} ET)")
+        return value
+
+    @model_validator(mode="after")
+    def _opens_before_it_closes(self) -> TradingWindow:
+        if self.start_seconds >= self.end_seconds:
+            raise ValueError(f"window must open before it closes ({self.start}–{self.end} ET)")
+        return self
+
+    @property
+    def start_seconds(self) -> int:
+        return _clock_seconds(self.start)
+
+    @property
+    def end_seconds(self) -> int:
+        return _clock_seconds(self.end)
+
+    @property
+    def label(self) -> str:
+        return f"{self.start}–{self.end} ET"
 
 
 class ModelSpec(BaseModel):
@@ -26,8 +94,9 @@ class ModelSpec(BaseModel):
 
     @field_validator("name")
     @classmethod
-    def _declared_approach(cls, name: str) -> str:
+    def _declared_profile(cls, name: str) -> str:
         get_investment_approach(name)
+        get_horizon_days(name)
         return name
 
 
@@ -69,6 +138,36 @@ class StrategySpec(BaseModel):
         return {m.name: m.weight for m in self.models}
 
 
+class AllocationPolicy(BaseModel):
+    """How the scorecard moves the mandate's weights: a confidence multiplier
+    on each strategy's capital slice and each model's blend weight.
+
+    `weight = mandate * clip(1 + slope * t, floor, cap)`, where t is the
+    analyst's IC t-stat or the sleeve's mean period return over its standard
+    deviation times sqrt(n). A t-stat pays for evidence of skill, not for one
+    lucky month; below `min_evidence` graded dates or periods the mandate
+    weight stands. The floor keeps a cut analyst producing graded views, so
+    it can earn its weight back. This is the multi-manager's rule for pods
+    and the quant desk's IC weighting for signals, shrunk to the mandate
+    while the record is short.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    min_evidence: int = Field(
+        default=20, ge=2, description="graded dates (analyst) or periods (strategy) before a weight moves"
+    )
+    slope: float = Field(default=0.25, ge=0, description="multiplier change per unit of t-stat")
+    floor: float = Field(default=0.25, gt=0, le=1, description="lowest multiplier")
+    cap: float = Field(default=2.0, ge=1, description="highest multiplier")
+
+    def multiplier(self, t_stat: float | None, n: int) -> float:
+        """What a mandate weight is multiplied by, given the evidence."""
+        if t_stat is None or n < self.min_evidence:
+            return 1.0
+        return min(self.cap, max(self.floor, 1 + self.slope * t_stat))
+
+
 class FundSpec(BaseModel):
     """A mandate with fund-level risk limits and no fixed ticker universe.
 
@@ -82,10 +181,26 @@ class FundSpec(BaseModel):
     name: str
     strategies: list[StrategySpec] = Field(min_length=1)
     risk: RiskLimits
+    costs: TradingCosts = Field(
+        default_factory=TradingCosts,
+        description="what every fill costs: half-spread per side and commission per share",
+    )
+    allocation: AllocationPolicy | None = Field(
+        default=None,
+        description="how the scorecard moves strategy slices and model weights; absent keeps every weight as written",
+    )
     capital: float = Field(default=100_000.0, gt=0)
-    rebalance: Literal["daily", "weekly", "monthly"] = Field(
+    rebalance: Cadence = Field(
         default="weekly",
-        description="rebalance frequency used by the backtester",
+        description="how often the fund decides: every bar (minute), or the first session of each day/week/month",
+    )
+    interval: float = Field(
+        default=1.0, gt=0,
+        description="minutes between sessions; read only when rebalance is minute",
+    )
+    window: TradingWindow = Field(
+        default_factory=TradingWindow,
+        description="trading hours in New York time; read only when rebalance is minute",
     )
     benchmark: str = Field(
         default="SPY",
@@ -105,6 +220,72 @@ class FundSpec(BaseModel):
         if duplicates:
             raise ValueError(f"duplicate strategy names: {sorted(duplicates)}")
         return strategies
+
+    @model_validator(mode="after")
+    def _interval_and_window_belong_to_minute_funds(self) -> FundSpec:
+        if self.rebalance != "minute":
+            stray = sorted({"interval", "window"} & self.model_fields_set)
+            if stray:
+                raise ValueError(f"{', '.join(stray)}: only a minute fund has these; this one is {self.rebalance}")
+            return self
+        if self.interval_seconds < MIN_INTERVAL_SECONDS:
+            raise ValueError(
+                f"interval: floor is {MIN_INTERVAL_SECONDS} second — sessions are stamped to the second"
+            )
+        if self.interval_seconds > self.window.end_seconds - self.window.start_seconds:
+            raise ValueError(
+                f"interval: {format_interval(self.interval_seconds)} is longer than the {self.window.label} window"
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        """Daily/weekly/monthly mandates serialize exactly as they did before
+        minute funds existed: `interval` and `window` mean nothing to them,
+        and every ledger record carries a serialized spec in its hash. For
+        the same reason a mandate at the default costs serializes without a
+        `costs` block, as every mandate did before costs existed."""
+        data = handler(self)
+        if self.rebalance != "minute":
+            data.pop("interval", None)
+            data.pop("window", None)
+        if self.costs == TradingCosts():
+            data.pop("costs", None)
+        if self.allocation is None:
+            data.pop("allocation", None)
+        return data
+
+    @property
+    def is_intraday(self) -> bool:
+        return self.rebalance == "minute"
+
+    @property
+    def interval_seconds(self) -> int:
+        """The bar length, to the second. Only meaningful for a minute fund."""
+        return int(round(self.interval * 60))
+
+    @property
+    def cadence_label(self) -> str:
+        """How the cadence reads: `daily`, or `every 30s` / `every 5m` / `every 1h30m`."""
+        if not self.is_intraday:
+            return self.rebalance
+        return f"every {format_interval(self.interval_seconds)}"
+
+
+def format_interval(seconds: int) -> str:
+    """`30s`, `5m`, `1h`, `1h30m`, `2m30s` — the shortest honest spelling."""
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if seconds < 60:
+        return f"{secs}s"
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs:
+        parts.append(f"{secs}s")
+    return "".join(parts)
 
 
 def normalize_universe(tickers: list[str]) -> list[str]:

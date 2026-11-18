@@ -20,6 +20,8 @@ MONDAY = "2024-06-10"
 
 
 class DatedAnalyst:
+    horizon_days = 1
+
     def __init__(self, views=None):
         self.views = views or {FRIDAY: 1, "2024-06-09": -1}
         self.calls = []
@@ -37,7 +39,8 @@ def make_fund(analyst=None):
     spec = FundSpec(schema_version=2, name="timing", capital=10_000,
                     strategies=[{"name": "macro", "models": [{"name": "druckenmiller"}],
                                  "blend": {"mode": "long_short"}}],
-                    risk={"max_position_pct": 1, "max_gross_exposure": 1})
+                    risk={"max_position_pct": 1, "max_gross_exposure": 1},
+                    costs={"spread_bps": 0, "commission_per_share": 0})
     return Fund(spec, models={"macro": [analyst]}), analyst
 
 

@@ -214,14 +214,33 @@ Bar > .bar--complete {
     padding: 2 2;
 }
 
+#select-history {
+    background: transparent;
+    height: auto;
+}
+
+/* The run list shows a cursor only while it is the active pane. Blurred, its
+   highlighted row looks like every other row, so the screen opens with one
+   cursor (on the mandate), not two. */
+#select-history > .option-list--option-highlighted {
+    background: transparent;
+    text-style: none;
+}
+
+#select-history:focus > .option-list--option-highlighted {
+    background: #0f2e1e;
+    color: #2bd97c;
+    text-style: bold;
+}
+
 /* ---------------- api key prompt ---------------- */
 
-KeyPromptScreen {
+KeyPromptScreen, DataKeyPromptScreen {
     align: center middle;
     background: #0b100e 70%;
 }
 
-#keyprompt {
+#keyprompt, #datakeyprompt {
     width: 72;
     max-width: 92%;
     height: auto;
@@ -236,6 +255,14 @@ KeyPromptScreen {
 
 #key-blurb {
     margin-bottom: 1;
+}
+
+#datakeyprompt .key-label {
+    margin-top: 1;
+}
+
+#datakeyprompt .key-note {
+    margin-top: 1;
 }
 
 /* ---------------- model picker ---------------- */
@@ -376,6 +403,12 @@ RunConfirmScreen {
     max-height: 100%;
 }
 
+/* The decisions rail carries a longer row (date, change, verdict, fills),
+   so it takes a few more cells than the signal rail. */
+#report-rail.wide {
+    width: 46;
+}
+
 #report-detail {
     width: 1fr;
     padding: 0 2;
@@ -409,6 +442,23 @@ RunConfirmScreen {
     width: 1fr;
 }
 
+#window-inputs {
+    height: auto;
+}
+
+#window-inputs Input {
+    width: 12;
+}
+
+.window-sep {
+    width: auto;
+    padding-top: 1;
+}
+
+#interval-line, #window-line {
+    margin-top: 1;
+}
+
 #stocks-preview {
     margin-top: 1;
 }
@@ -440,6 +490,11 @@ RunConfirmScreen {
     margin-right: 1;
     text-align: center;
     content-align: center middle;
+}
+
+#scorecard {
+    height: auto;
+    margin-top: 1;
 }
 
 #curve-box {
